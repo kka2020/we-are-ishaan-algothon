@@ -1,0 +1,150 @@
+import time
+import threading
+import requests  # Crucial for pulling real-world Weather/Flight APIs
+import json      # Crucial for parsing the API data
+
+# Import everything needed from the framework they gave you
+from cmi_bot import BaseBot, OrderBook, Trade, OrderRequest, Side
+
+MAX_POSITION = 100
+EDGE_THRESHOLD = 2.0
+
+class MyTradingBot(BaseBot):
+    def __init__(self, cmi_url: str, username: str, password: str):
+        super().__init__(cmi_url, username, password)
+        
+        # Internal state
+        self.fair_values = {"M1": 0.0, "M3": 0.0, "M5": 0.0}
+        self.latest_books = {}
+        self.current_positions = {}  # Cached to prevent API spam
+
+    def start(self):
+        """Starts the exchange connection and our custom background threads."""
+        super().start() 
+        
+        # Thread 1: Fetch real-world data (Weather, Flights, Tides) every 60s
+        threading.Thread(target=self.fetch_real_world_data, daemon=True).start()
+        
+        # Thread 2: Track positions safely every 1s (Prevents API rate-limiting)
+        threading.Thread(target=self.update_positions_loop, daemon=True).start()
+        
+        print("🚀 Bot started. Listening to streams...")
+
+    def update_positions_loop(self):
+        """Fetches your inventory once a second to enforce the ±100 limit safely."""
+        while True:
+            try:
+                self.current_positions = self.get_positions()
+            except Exception as e:
+                print(f"⚠️ Failed to fetch positions: {e}")
+            time.sleep(1)
+
+    def fetch_real_world_data(self):
+        """Pulls from real-world APIs to calculate Fair Value (FV)."""
+        while True:
+            try:
+                # Example: How to actually use requests for the weather API
+                # response = requests.get("https://api.openweathermap.org/data/2.5/weather?q=London&appid=YOUR_API_KEY")
+                # data = response.json()
+                # temp = data["main"]["temp"]
+                
+                # Dummy values (Replace these with parsed API data)
+                temp, humidity = 33, 29
+                water_level = -1.41
+                total_flights = 1200
+                
+                # Calculate Fair Values
+                self.fair_values["M3"] = temp * humidity
+                self.fair_values["M1"] = abs(water_level) * 1000
+                self.fair_values["M5"] = total_flights
+                
+            except Exception as e:
+                print(f"⚠️ API Fetch Error: {e}")
+                
+            time.sleep(60) # Wait 60 seconds before pulling data again
+
+    def on_trades(self, trade: Trade) -> None:
+        """Triggered when trades happen. We don't strictly need this to win."""
+        pass
+
+    def on_orderbook(self, ob: OrderBook) -> None:
+        """Triggered instantly whenever an order book updates."""
+        self.latest_books[ob.product] = ob
+        
+        # Ignore empty books
+        if not ob.buy_orders or not ob.sell_orders:
+            return
+
+        best_bid = ob.buy_orders[0].price
+        best_ask = ob.sell_orders[0].price
+        
+        # Read from our locally cached positions
+        current_pos = self.current_positions.get(ob.product, 0)
+
+        # ---------------------------------------------------------
+        # 1. DIRECTIONAL TRADING (M1, M3, M5)
+        # ---------------------------------------------------------
+        if ob.product in self.fair_values and self.fair_values[ob.product] > 0:
+            fv = self.fair_values[ob.product]
+            
+            # Undervalued -> BUY
+            if best_ask < fv - EDGE_THRESHOLD and current_pos < MAX_POSITION:
+                print(f"📈 {ob.product} Cheap! BUY at {best_ask} (FV: {fv})")
+                self.send_order(OrderRequest(ob.product, best_ask, Side.BUY, 1))
+
+            # Overvalued -> SELL
+            elif best_bid > fv + EDGE_THRESHOLD and current_pos > -MAX_POSITION:
+                print(f"📉 {ob.product} Expensive! SELL at {best_bid} (FV: {fv})")
+                self.send_order(OrderRequest(ob.product, best_bid, Side.SELL, 1))
+
+        # ---------------------------------------------------------
+        # 2. ETF ARBITRAGE (M7 vs M1+M3+M5)
+        # ---------------------------------------------------------
+        if all(m in self.latest_books for m in ["M1", "M3", "M5", "M7"]):
+            b1, b3, b5, b7 = [self.latest_books[m] for m in ["M1", "M3", "M5", "M7"]]
+            
+            if all(b.buy_orders and b.sell_orders for b in [b1, b3, b5, b7]):
+                sum_bids = b1.buy_orders[0].price + b3.buy_orders[0].price + b5.buy_orders[0].price
+                sum_asks = b1.sell_orders[0].price + b3.sell_orders[0].price + b5.sell_orders[0].price
+                
+                m7_bid = b7.buy_orders[0].price
+                m7_ask = b7.sell_orders[0].price
+
+                # Check limit caps for all 4 markets involved
+                can_buy_m7 = self.current_positions.get("M7", 0) < MAX_POSITION and all(self.current_positions.get(m, 0) > -MAX_POSITION for m in ["M1", "M3", "M5"])
+                can_sell_m7 = self.current_positions.get("M7", 0) > -MAX_POSITION and all(self.current_positions.get(m, 0) < MAX_POSITION for m in ["M1", "M3", "M5"])
+
+                # M7 is Underpriced -> Buy M7, Sell Components
+                if m7_ask < sum_bids - EDGE_THRESHOLD and can_buy_m7:
+                    print(f"🚨 ARB: Buying M7 at {m7_ask}, Selling components")
+                    self.send_orders([
+                        OrderRequest("M7", m7_ask, Side.BUY, 1),
+                        OrderRequest("M1", b1.buy_orders[0].price, Side.SELL, 1),
+                        OrderRequest("M3", b3.buy_orders[0].price, Side.SELL, 1),
+                        OrderRequest("M5", b5.buy_orders[0].price, Side.SELL, 1),
+                    ])
+
+                # M7 is Overpriced -> Sell M7, Buy Components
+                elif m7_bid > sum_asks + EDGE_THRESHOLD and can_sell_m7:
+                    print(f"🚨 ARB: Selling M7 at {m7_bid}, Buying components")
+                    self.send_orders([
+                        OrderRequest("M7", m7_bid, Side.SELL, 1),
+                        OrderRequest("M1", b1.sell_orders[0].price, Side.BUY, 1),
+                        OrderRequest("M3", b3.sell_orders[0].price, Side.BUY, 1),
+                        OrderRequest("M5", b5.sell_orders[0].price, Side.BUY, 1),
+                    ])
+
+# --- RUN SCRIPT ---
+if __name__ == "__main__":
+    # Insert the actual exchange URL, Username, and Password here
+    bot = MyTradingBot("http://INSERT_EXCHANGE_URL", "USERNAME", "PASSWORD")
+    
+    bot.start()
+    
+    try:
+        # Keep the main thread alive so background threads can run
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\n🛑 Stopping bot gracefully...")
+        bot.stop()
