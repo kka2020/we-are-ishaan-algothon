@@ -185,8 +185,8 @@ class BaseBot(ABC):
 
     def __init__(self, cmi_url: str, username: str, password: str):
         self._cmi_url = cmi_url.rstrip("/")
-        self.username = "WeAreIshaanZ"
-        self._password = "weareishaanz2209"
+        self.username = username
+        self._password = password
         self._sse_thread: _SSEThread | None = None
 
         # Incremental trade state
